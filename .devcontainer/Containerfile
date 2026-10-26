@@ -1,0 +1,22 @@
+FROM registry.fedoraproject.org/fedora:44
+
+# Toolchain and build generators (buildconf/configure need autoconf, bison, re2c),
+# plus the libraries behind the extensions CI's Linux configure enables.
+RUN dnf install -y \
+        gcc gcc-c++ clang lld llvm make autoconf automake libtool \
+        bison re2c pkgconf-pkg-config \
+        git gdb valgrind diffutils findutils which file procps-ng \
+        unzip tar xz tzdata glibc-langpack-en glibc-langpack-de \
+        libxml2-devel sqlite-devel openssl-devel zlib-devel bzip2-devel \
+        libcurl-devel oniguruma-devel libzip-devel libicu-devel gmp-devel \
+        libsodium-devel libargon2-devel libffi-devel libedit-devel readline-devel \
+        libxslt-devel gettext-devel \
+        libjpeg-turbo-devel libpng-devel libwebp-devel libavif-devel \
+        freetype-devel libXpm-devel \
+        libtidy-devel enchant2-devel libpq-devel openldap-devel cyrus-sasl-devel \
+        net-snmp-devel unixODBC-devel freetds-devel lmdb-devel gdbm-devel \
+    && dnf clean all
+
+RUN useradd --uid 1000 --create-home dev
+
+USER dev

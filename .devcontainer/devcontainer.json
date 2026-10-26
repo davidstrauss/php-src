@@ -1,0 +1,7 @@
+{
+  "name": "php-src",
+  "build": {
+    "dockerfile": "Containerfile"
+  },
+  "remoteUser": "dev"
+}

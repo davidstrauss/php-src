@@ -1,0 +1,144 @@
+version: '3'
+
+vars:
+  JOBS:
+    sh: nproc
+  # The extensions CI's Linux job configures (.github/actions/configure-x64),
+  # minus Firebird, Tokyo Cabinet and QDBM, whose libraries the devcontainer lacks.
+  CONFIGURE_FLAGS: >-
+    --enable-option-checking=fatal
+    --enable-debug
+    --enable-phpdbg
+    --enable-fpm
+    --with-pdo-mysql=mysqlnd
+    --with-mysqli=mysqlnd
+    --with-pgsql
+    --with-pdo-pgsql
+    --with-pdo-sqlite
+    --enable-intl
+    --without-pear
+    --enable-gd
+    --with-jpeg
+    --with-webp
+    --with-avif
+    --with-freetype
+    --with-xpm
+    --enable-exif
+    --with-zip
+    --with-zlib
+    --enable-soap
+    --enable-xmlreader
+    --with-xsl
+    --with-tidy
+    --enable-sysvsem
+    --enable-sysvshm
+    --enable-shmop
+    --enable-pcntl
+    --without-readline
+    --with-libedit
+    --enable-mbstring
+    --with-curl
+    --with-gettext
+    --enable-sockets
+    --with-bz2
+    --with-openssl
+    --with-gmp
+    --enable-bcmath
+    --enable-calendar
+    --enable-ftp
+    --with-enchant=/usr
+    --enable-sysvmsg
+    --with-ffi
+    --enable-zend-test
+    --enable-dl-test=shared
+    --with-ldap
+    --with-ldap-sasl
+    --with-password-argon2
+    --with-mhash
+    --with-sodium
+    --enable-dba
+    --with-cdb
+    --enable-flatfile
+    --enable-inifile
+    --with-lmdb
+    --with-gdbm
+    --with-snmp
+    --with-unixODBC
+    --with-pdo-odbc=unixODBC,/usr
+    --with-pdo-dblib
+
+tasks:
+  buildconf:
+    desc: Generate ./configure from configure.ac and the extensions' config.m4 files
+    cmds:
+      - ./buildconf --force
+
+  configure:
+    desc: "Configure a debug build with CI's extensions (extra flags after --, e.g. task configure -- --enable-address-sanitizer)"
+    cmds:
+      - task: buildconf
+      - ./configure {{.CONFIGURE_FLAGS}} {{.CLI_ARGS}}
+
+  configure:minimal:
+    desc: Configure a debug build with only the default extensions (fast to build)
+    cmds:
+      - task: buildconf
+      - ./configure --enable-debug --enable-zend-test {{.CLI_ARGS}}
+
+  build:
+    desc: Build PHP (configures first when there is no Makefile yet)
+    cmds:
+      - task: configure
+        if: '[ ! -f Makefile ]'
+      - make -j{{.JOBS}}
+
+  test:
+    desc: "Run the test suite, or the tests named after -- (e.g. task test -- Zend/tests ext/standard/tests/array)"
+    deps: [build]
+    env:
+      NO_INTERACTION: '1'
+    cmds:
+      - sapi/cli/php run-tests.php -P -q -j{{.JOBS}} -g FAIL,BORK,LEAK,XLEAK --show-diff {{.CLI_ARGS}}
+
+  test:zend:
+    desc: Run the Zend engine's tests
+    deps: [build]
+    env:
+      NO_INTERACTION: '1'
+    cmds:
+      - sapi/cli/php run-tests.php -P -q -j{{.JOBS}} -g FAIL,BORK,LEAK,XLEAK --show-diff Zend
+
+  php:
+    desc: "Run the built CLI (arguments after --, e.g. task php -- -r 'echo PHP_VERSION;')"
+    cmds:
+      - sapi/cli/php {{.CLI_ARGS}}
+
+  stubs:
+    desc: Regenerate arginfo headers from the *.stub.php files
+    cmds:
+      - sapi/cli/php build/gen_stub.php
+
+  verify:generated:
+    desc: Regenerate every generated file (arginfo, VM, lexers, parsers) and fail if any changed, as CI does
+    deps: [build]
+    env:
+      PATH: '{{.ROOT_DIR}}/sapi/cli:{{env "PATH"}}'
+    cmds:
+      - scripts/dev/credits
+      - scripts/dev/genfiles
+      - scripts/gdb/debug_gdb_scripts_gen.php
+      - Zend/zend_vm_gen.php
+      - ext/tokenizer/tokenizer_data_gen.php
+      - build/gen_stub.php -f --generate-optimizer-info --verify
+      - ext/phar/makestub.php
+      - .github/scripts/test-directory-unchanged.sh .
+
+  clean:
+    desc: Remove build objects, keeping the configuration
+    cmds:
+      - make clean
+
+  distclean:
+    desc: Remove build objects and the configuration
+    cmds:
+      - make distclean
