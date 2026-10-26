@@ -1,6 +1,7 @@
 # Running PHP under a W^X policy
 
-Status: design draft.
+Status: design draft. Statements about PHP's own code are checked against this
+tree and link to it; statements about frameworks are not, and say so.
 
 ## Goal
 
@@ -40,17 +41,27 @@ The kernel does not enforce the securebits; the interpreter does.
 ### Opcache output is data
 
 Opcache stores opcodes, which PHP's interpreter reads as data. They never need
-executable memory. In this tree, only three things make writable memory
-executable:
+executable memory: opcache's shared memory is mapped read-write, without
+`PROT_EXEC`, on Linux ([shared_alloc_mmap.c:183](../ext/opcache/shared_alloc_mmap.c#L183)).
+In this tree, only three things make writable memory executable:
 
-- the opcache JIT ([zend_jit.c:3824](../ext/opcache/jit/zend_jit.c#L3824));
-- PCRE's JIT (sljit, under `ext/pcre/pcre2lib/sljit/`), controlled by `pcre.jit`;
-- `opcache.huge_code_pages`, which copies PHP's own code into anonymous
-  executable memory ([ZendAccelerator.c:3267](../ext/opcache/ZendAccelerator.c#L3267)).
+- **The opcache JIT.** On Linux it takes its buffer from opcache's shared memory
+  and switches it between writable and executable with `mprotect()`
+  ([zend_jit.c:3566](../ext/opcache/jit/zend_jit.c#L3566),
+  [zend_jit.c:3593](../ext/opcache/jit/zend_jit.c#L3593)). In ZTS builds the
+  buffer is writable and executable at the same time. The JIT defaults to
+  `opcache.jit=disable` ([zend_accelerator_module.c:349](../ext/opcache/zend_accelerator_module.c#L349)),
+  which turns it off entirely ([zend_jit.c:3684](../ext/opcache/jit/zend_jit.c#L3684)).
+- **PCRE's JIT** (sljit, under `ext/pcre/pcre2lib/sljit/`), controlled by
+  `pcre.jit`, which defaults to on ([php_pcre.c:351](../ext/pcre/php_pcre.c#L351)).
+- **`opcache.huge_code_pages`**, which copies PHP's own code into anonymous
+  memory that is writable and executable while it is set up
+  ([ZendAccelerator.c:3267](../ext/opcache/ZendAccelerator.c#L3267)). It
+  defaults to off ([zend_accelerator_module.c:339](../ext/opcache/zend_accelerator_module.c#L339)).
 
 With those three off, stock PHP already satisfies a kernel W^X policy for its
-own memory. What it does not yet do is take part in the policy for the PHP code
-it runs.
+own memory; with the defaults in this tree, only `pcre.jit` needs changing.
+What PHP does not yet do is take part in the policy for the PHP code it runs.
 
 ## Design
 
@@ -59,16 +70,37 @@ it runs.
 PHP runs `AT_EXECVE_CHECK` on the file descriptor of every file it is about to
 compile, and on every opcache file-cache entry it is about to load:
 
-- **Source files**: where PHP opens a script in order to compile it, when
-  `SECBIT_EXEC_RESTRICT_FILE` is set or an ini setting asks for it.
-- **Opcache file-cache entries**: where opcache opens a cache file to load it.
-  Opcache does not use a cache file in place. It reads it and rewrites the
-  pointers inside ([zend_file_cache.c](../ext/opcache/zend_file_cache.c)), so the
-  check has to be on the file itself. The cache file is the compiled form of
-  the code, so it gets the same trust decision as the source.
+- **Source files**, when `SECBIT_EXEC_RESTRICT_FILE` is set or an ini setting
+  asks for it. Scripts are opened in three places:
+  - the CLI opens its script with `fopen()` ([php_cli.c:558](../sapi/cli/php_cli.c#L558));
+  - FPM and CGI go through `php_fopen_primary_script()` ([fopen_wrappers.c:365](../main/fopen_wrappers.c#L365));
+  - `include` and `require` open a PHP stream ([main.c:1665](../main/main.c#L1665)).
+
+  All three meet in `zend_stream_fixup()` ([zend_stream.c:126](../Zend/zend_stream.c#L126)),
+  called from `open_file_for_scanning()` ([zend_language_scanner.l:529](../Zend/zend_language_scanner.l#L529))
+  before every file is compiled. That is the one place to check. The Zend layer
+  cannot see a PHP stream's descriptor, so `main/` needs to provide it through a
+  hook, as it already provides `zend_stream_open_function`. A handle with no
+  descriptor (`data://`, `php://memory`) cannot pass the check, which covers
+  stream includes. Stdin, which the CLI reads as a `FILE *`, passes only if
+  descriptor 0 itself passes, as the kernel's documentation asks.
+- **Opcache file-cache entries.** `zend_file_cache_script_load_ex()` opens the
+  cache file ([zend_file_cache.c:1937](../ext/opcache/zend_file_cache.c#L1937)),
+  reads it into memory and rewrites the pointers inside. Opcache does not use a
+  cache file in place, so the check has to be on the descriptor opened there.
+  The cache file is the compiled form of the code, so it gets the same trust
+  decision as the source. Today, the only integrity checks are the PHP build ID
+  ([zend_file_cache.c:1971](../ext/opcache/zend_file_cache.c#L1971)) and an
+  Adler-32 checksum ([zend_file_cache.c:2033](../ext/opcache/zend_file_cache.c#L2033)),
+  which detect accidents, not tampering.
 
 The check runs on the same descriptor PHP then reads from, so the file cannot be
 swapped between the check and the read.
+
+A script that opcache finds in shared memory by its lookup key is used without
+opening the file again ([ZendAccelerator.c:2291](../ext/opcache/ZendAccelerator.c#L2291)),
+so it is checked once, when first compiled or loaded. That is sound only while
+the files cannot change, which the verity image guarantees.
 
 Using `AT_EXECVE_CHECK` instead of mapping the data `PROT_EXEC` to see whether
 the LSM allows it:
@@ -96,26 +128,52 @@ refuses:
 - `include` and `require` of anything that is not a plain file: `data://`,
   `php://`, `phar://`, and URL wrappers.
 
-`eval()` is part of the language, so `disable_functions` cannot turn it off;
-this needs to be a new check in the engine.
+`eval()` is part of the language (an opcode, not a function), so
+`disable_functions` cannot turn it off; this needs to be a new check in the
+engine. Every way of compiling code from a string goes through
+`zend_compile_string()`:
+
+- `eval()` ([zend_execute.c:5417](../Zend/zend_execute.c#L5417));
+- `zend_eval_stringl()` ([zend_execute_API.c:1427](../Zend/zend_execute_API.c#L1427)),
+  which the CLI uses for `-r`, `-B`, `-R` and `-E`
+  ([php_cli.c:971](../sapi/cli/php_cli.c#L971)) and extensions can call;
+- phpdbg's prompt and conditional breakpoints.
+
+Refusing in `zend_compile_string()` covers all of them at once.
+
+Stream includes are covered by the descriptor check in section 1. Opcache sends
+any stream other than `file://` and `phar://` straight to the normal compiler
+([ZendAccelerator.c:205](../ext/opcache/ZendAccelerator.c#L205),
+[ZendAccelerator.c:2292](../ext/opcache/ZendAccelerator.c#L2292)), so the check
+has to sit in the normal compile path, not only in opcache.
 
 ### 3. Running other programs
 
-`system()`, `exec()`, `shell_exec()`, backticks, `passthru()` and `popen()` all
-run `/bin/sh -c`. On a system without a shell they already fail. An ini setting
-turns them off with a clear error instead. Points to watch:
+These functions all run `/bin/sh -c` through the C library's `popen()`:
 
-- `mail()` runs sendmail through `popen()`, and WordPress's `wp_mail` uses it by
-  default. WordPress sites need SMTP instead.
-- `proc_open()` with an array of arguments does not use a shell. It is
+- `exec()`, `system()` and `passthru()` ([exec.c:123](../ext/standard/exec.c#L123));
+- `shell_exec()` and backticks ([exec.c:514](../ext/standard/exec.c#L514));
+- `popen()` ([file.c:843](../ext/standard/file.c#L843)).
+
+On a system without a shell they already fail. An ini setting turns them off
+with a clear error instead. Points to watch:
+
+- `mail()` runs sendmail through `popen()` ([mail.c:574](../ext/standard/mail.c#L574)),
+  and WordPress's `wp_mail` uses it by default. WordPress sites need SMTP
+  instead.
+- `proc_open()` with a command string runs `/bin/sh -c`; with an array of
+  arguments it runs the program directly, without a shell
+  ([proc_open.c:1417](../ext/standard/proc_open.c#L1417),
+  [proc_open.c:1447](../ext/standard/proc_open.c#L1447)). The array form is
   compatible with W^X as long as the program it runs is on the image.
-- `pcntl_exec()` also starts programs and should be covered by the same
-  setting.
+- `pcntl_exec()` calls `execve()` directly ([pcntl.c:763](../ext/pcntl/pcntl.c#L763))
+  and should be covered by the same setting.
 
 ### 4. A hardened configuration profile
 
 No code changes. These settings make stock PHP compatible with a kernel W^X
-policy for its own memory:
+policy for its own memory. The first two are already the defaults in this tree;
+setting them explicitly guards against a distribution's `php.ini` changing them.
 
 ```ini
 opcache.jit=disable
@@ -134,8 +192,22 @@ opcache.validate_timestamps=0
 
 `opcache.file_cache_only` already turns the JIT off
 ([ZendAccelerator.c:3599](../ext/opcache/ZendAccelerator.c#L3599)). An opcache
-file cache only loads in the exact PHP build that wrote it, so the cache must be
-built with the same binary that runs it. That suits images.
+file cache only loads in the exact PHP build that wrote it
+([zend_file_cache.c:1971](../ext/opcache/zend_file_cache.c#L1971)), so the cache
+must be built with the same binary that runs it. That suits images.
+
+What this configuration does not do, and the strict cache-only mode in the plan
+has to add:
+
+- **The source file must still exist.** Opcache opens it on every load to
+  resolve its real path, and finds the cache file from that path
+  ([ZendAccelerator.c:1936](../ext/opcache/ZendAccelerator.c#L1936),
+  [zend_file_cache.c:1935](../ext/opcache/zend_file_cache.c#L1935)). The image
+  ships both the source and the cache.
+- **A cache miss compiles the source**
+  ([ZendAccelerator.c:1989](../ext/opcache/ZendAccelerator.c#L1989)).
+  `file_cache_read_only` only stops the result being written back. The strict
+  mode refuses there instead.
 
 ## Code that frameworks generate at runtime
 
@@ -243,7 +315,8 @@ makes this clean.
 
 Developers expect to save a file and reload the page. In development, no W^X
 policy applies and PHP runs as it does today. On deployment, the image and its
-caches are rebuilt and PHP-FPM reloads gracefully (SIGUSR2). That is tooling
+caches are rebuilt and PHP-FPM reloads gracefully (SIGUSR2,
+[php-fpm.8.in:169](../sapi/fpm/php-fpm.8.in#L169)). That is tooling
 around PHP, not a change to it.
 
 An out-of-process JIT, with a compiler handing sealed memory to the runtime,
