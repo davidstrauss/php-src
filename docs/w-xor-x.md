@@ -396,10 +396,69 @@ Drupal also compiles Twig text stored in configuration, for example the
 - if the configuration is exported and shipped with the image, it is an input
   to the hermetic build like any template file;
 - if someone edits it in production, it is user-created data. It must be
-  refused, or wait for the next build.
+  refused, wait for the next build, or go through a schema-checked exception
+  (below).
 
 Read-only configuration in production, which many Drupal hosts already use,
 makes this clean.
+
+#### Schema-checked exceptions
+
+Some Drupal sites cannot freeze their configuration: editors change Views in
+production as part of their work. For them, the compiler can accept parameters
+from the worker, but only through a narrow, declared exception. This weakens the
+model, and the design says so where it can be seen.
+
+**What changes.** Without exceptions, everything the kernel trusts was built
+from the image. With them, the store also holds code compiled from text a worker
+supplied. The guarantee becomes: code from the image, plus templates the
+compiler built from validated input inside a sandbox. A compromised worker can
+now choose some of what gets compiled, within the limits below.
+
+**How it is bounded:**
+
+- **Exception kinds are declared on the image, not by the worker.** A manifest
+  on the image lists each kind (for example `views_field_rewrite`), its JSON
+  Schema, the compiler entry point it uses and its Twig sandbox policy. A worker
+  can only name a declared kind and supply its parameters; the schema and the
+  policy are never taken from the request.
+- **The schema is strict.** `additionalProperties: false` everywhere; every
+  string has a `maxLength`; identifiers (view, display and field names) are
+  `enum`s or tight `pattern`s; no free-form objects. The compiler validates,
+  never the worker. Parameters are canonicalised (RFC 8785) before hashing, so
+  the content address covers exactly what was validated.
+- **A schema cannot make template text safe; Twig's sandbox has to.** A schema
+  can say "a string of at most 4 KiB", not "Twig that does nothing dangerous".
+  The two do different jobs:
+  - the schema protects the *structure*: identifiers that end up in generated
+    PHP (class names, cache keys, paths) cannot carry anything unexpected;
+  - Twig's `SandboxExtension`, with a per-kind allow-list of tags, filters,
+    functions, methods and properties, limits what the template text can do.
+    For a Views rewrite that is roughly `if`, `for`, output and a few string
+    filters, with no functions and no method calls.
+
+  Server-side template injection is a well-known class of bugs, and Twig's
+  sandbox has had escapes. That is why the allow-lists should be as small as the
+  feature allows, and why the Twig compiler's own escaping of literals into
+  PHP becomes part of what is trusted.
+- **Exception output goes to its own store.** The kernel policy can then trust
+  it separately: a site that wants the full guarantee simply does not trust the
+  exception store, and nothing compiled from parameters can run there.
+- **Every exception compile is logged** with the kind, the canonical parameters
+  and the output's hash, so an incident can be traced back to the exact input.
+- **Each kind has a quota** on distinct outputs, so a worker cannot use the
+  compiler to fill the store or probe the sandbox at volume.
+- **Each kind has its own audit and enforce mode** (section 4). In audit mode
+  the exception compiles and logs; turning a kind off makes its compiles fail
+  without affecting the rest.
+- **Exception output is harvested like any lazy compile.** At the next build,
+  the outputs (and their parameters) can be reviewed and baked into the image,
+  where they become ordinary image-trusted code.
+
+**Worker side, for Drupal:** the same PhpStorage class sends the kind and
+parameters instead of a template name when Twig compiles a template from a
+string, for example through the `inline_template` render element. Which render
+paths map to which kinds is part of the survey in the plan.
 
 ## Development workflow
 
@@ -430,11 +489,16 @@ the compiler process would stay able to change the code after sealing it.
    never compiles source, with the same audit and enforce modes.
 5. **Hermetic lazy compiler** for Drupal's Twig, once the kernel trust question
    is settled.
-6. **Deployment tooling:** rebuild and reload on change.
+6. **Schema-checked exceptions,** starting with one kind (Views field rewrites)
+   and only for sites that cannot make configuration read-only.
+7. **Deployment tooling:** rebuild and reload on change.
 
 ## Open questions
 
-- Which store-trust option `RestrictFileSystemAccess=` can support.
+- Which store-trust option `RestrictFileSystemAccess=` can support, and whether
+  it can trust the exception store separately from the main store.
+- Which Drupal features compile Twig from strings in practice, and whether a
+  sandbox allow-list small enough to be worth trusting still covers them.
 - How many Drupal templates `drush twig:compile` leaves uncompiled on a real
   site.
 - Whether enforce mode should treat an untrusted cache file as a miss (compile
