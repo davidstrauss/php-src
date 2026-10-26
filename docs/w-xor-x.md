@@ -123,11 +123,12 @@ the LSM allows it:
 
 In practice, "trusted" means "executable": the build marks cache files and
 scripts executable and puts them on the verity image. A file the policy does not
-trust fails the check. PHP then treats it as a cache miss, or as an error in
-strict mode.
+trust fails the check. What PHP does then depends on the mode (section 4): in
+audit mode it logs the failure and loads the file anyway; in enforce mode it
+refuses.
 
-On kernels older than 6.14, the strict mode refuses to start. The non-strict
-mode logs that it cannot check and carries on.
+On kernels older than 6.14, enforce mode refuses to start. Audit mode logs once
+that it cannot check and carries on.
 
 ### 2. PHP refuses code that does not come from a checked file
 
@@ -166,8 +167,8 @@ These functions all run `/bin/sh -c` through the C library's `popen()`:
 - `shell_exec()` and backticks ([exec.c:514](../ext/standard/exec.c#L514));
 - `popen()` ([file.c:843](../ext/standard/file.c#L843)).
 
-On a system without a shell they already fail. An ini setting turns them off
-with a clear error instead. Points to watch:
+On a system without a shell they already fail. `exec_policy.processes`
+(section 4) turns them off cleanly instead. Points to watch:
 
 - `mail()` runs sendmail through `popen()` ([mail.c:574](../ext/standard/mail.c#L574)),
   and WordPress's `wp_mail` uses it by default. WordPress sites need SMTP
@@ -180,7 +181,84 @@ with a clear error instead. Points to watch:
 - `pcntl_exec()` calls `execve()` directly ([pcntl.c:763](../ext/pcntl/pcntl.c#L763))
   and should be covered by the same setting.
 
-### 4. A hardened configuration profile
+### 4. Audit and enforce modes
+
+A site turning this on needs to find out what would break before anything does.
+Each control therefore has three modes:
+
+- **`off`**: today's behaviour. Nothing is checked or logged.
+- **`audit`**: PHP runs every check and logs what would have been refused, but
+  carries on as if the check had passed. Nothing changes for the site's users.
+- **`enforce`**: PHP refuses what fails the check.
+
+The controls are set separately, because sites will fix them at different
+speeds. A site might enforce the `eval()` refusal on day one while it is still
+auditing file checks and moving its mail to SMTP. Proposed ini settings, all
+`PHP_INI_SYSTEM` so that a script cannot change them:
+
+| Setting | Controls | Section |
+|---|---|---|
+| `exec_policy.files` | `AT_EXECVE_CHECK` on scripts and opcache cache files | 1 |
+| `exec_policy.strings` | `eval()`, `-r`, stdin and other code compiled from strings | 2 |
+| `exec_policy.processes` | The shell and exec functions, `mail()` and `pcntl_exec()` | 3 |
+| `opcache.file_cache_strict` | A cache miss compiles source (audit) or fails (enforce) | 5 |
+
+The names are placeholders for the RFC.
+
+**The kernel's securebits override the ini settings.** If
+`SECBIT_EXEC_RESTRICT_FILE` is set, PHP enforces `exec_policy.files`; if
+`SECBIT_EXEC_DENY_INTERACTIVE` is set, it enforces `exec_policy.strings`;
+whatever the ini says. The kernel's contract requires it, and an ini file must
+not be able to weaken a policy the system imposed. The other two controls have
+no securebit and follow the ini alone. Audit mode is for sites trying the
+hardening on their own, before the system sets the securebits. PHP reports the
+mode actually in force, and why, in `phpinfo()` and `php -i`.
+
+**What audit mode logs.** One structured record per would-be refusal:
+
+- the control and the mode;
+- what was refused: the file's path and the check's `errno`, the first line of
+  the string being compiled, or the command being run;
+- where it came from: the PHP file and line that made the call, and for web
+  requests the request URI;
+- the process ID and SAPI.
+
+The records go to PHP's error log at a fixed level, and to the journal when PHP
+runs under systemd. They must not go to the page (`display_errors`), and
+neither `@` nor a user error handler may suppress them; otherwise an
+application could hide its own violations. Each distinct (control, path or call
+site) is logged once per worker process, so a busy site does not flood its logs.
+Opcache's status (`opcache_get_status()`) also counts audit events, so a site
+can watch the number fall to zero before switching to enforce.
+
+**What enforce mode does.** Each refusal is a clear, catchable `Error` naming
+the policy, not a missing-file warning or a generic failure, so frameworks show
+it and logs explain it:
+
+- `include` of a file that fails the check: `Error`, also for `include`, where a
+  missing file would only warn. Silently skipping code is worse than stopping.
+- `eval()` and other string compilation: `Error`.
+- An exec function: the functions are removed, as `disable_functions` removes
+  them, so calling one is the usual undefined-function `Error`. Libraries often
+  check `function_exists('proc_open')` or `is_callable('exec')` and fall back to
+  something else; removing the functions lets that fallback work. In audit mode
+  the functions stay and each call is logged, so the log shows what enforce mode
+  will take away.
+- A miss under `opcache.file_cache_strict`: `Error`, as for a file that fails
+  the check.
+
+Enforce mode logs the same records as audit mode.
+
+**The rollout this enables:**
+
+1. Deploy with every control in `audit`, in staging and then in production.
+2. Read the log: each record names the file, call site or command to fix
+   (warm a framework cache at build time, switch mail to SMTP, pass
+   `proc_open()` an array).
+3. Switch each control to `enforce` once its count stays at zero.
+4. Let the system set the securebits, which locks in enforcement.
+
+### 5. A hardened configuration profile
 
 No code changes. These settings make stock PHP compatible with a kernel W^X
 policy for its own memory. The first two are already the defaults in this tree;
@@ -207,8 +285,8 @@ file cache only loads in the exact PHP build that wrote it
 ([zend_file_cache.c:1971](../ext/opcache/zend_file_cache.c#L1971)), so the cache
 must be built with the same binary that runs it. That suits images.
 
-What this configuration does not do, and the strict cache-only mode in the plan
-has to add:
+What this configuration does not do, and `opcache.file_cache_strict`
+(section 4) has to add:
 
 - **The source file must still exist.** Opcache opens it on every load to
   resolve its real path, and finds the cache file from that path
@@ -217,8 +295,9 @@ has to add:
   ships both the source and the cache.
 - **A cache miss compiles the source**
   ([ZendAccelerator.c:1989](../ext/opcache/ZendAccelerator.c#L1989)).
-  `file_cache_read_only` only stops the result being written back. The strict
-  mode refuses there instead.
+  `file_cache_read_only` only stops the result being written back.
+  `opcache.file_cache_strict` logs the miss there in audit mode and refuses it
+  in enforce mode.
 
 ## Code that frameworks generate at runtime
 
@@ -341,12 +420,14 @@ the compiler process would stay able to change the code after sealing it.
 1. **Hardened profile:** the configuration above, and a run of PHP's test suite
    under it.
 2. **PHP patch:** `AT_EXECVE_CHECK` on scripts and opcache cache files, the
-   securebits, and ini settings that refuse `eval()` and running programs.
+   securebits, and the `exec_policy.*` controls for files, strings and
+   processes, each with audit and enforce modes and the audit log.
 3. **Framework survey:** a stock install of Drupal, WordPress, Symfony and
-   Laravel, each running from a read-only code directory under the profile and
-   the patch, with build-time warmup. Record what breaks.
-4. **Strict cache-only mode:** opcache loads only checked cache files and never
-   compiles source.
+   Laravel, each running from a read-only code directory under the profile,
+   with build-time warmup and every control in audit mode. The audit log is the
+   survey's result: what each framework would break.
+4. **`opcache.file_cache_strict`:** opcache loads only checked cache files and
+   never compiles source, with the same audit and enforce modes.
 5. **Hermetic lazy compiler** for Drupal's Twig, once the kernel trust question
    is settled.
 6. **Deployment tooling:** rebuild and reload on change.
@@ -356,5 +437,7 @@ the compiler process would stay able to change the code after sealing it.
 - Which store-trust option `RestrictFileSystemAccess=` can support.
 - How many Drupal templates `drush twig:compile` leaves uncompiled on a real
   site.
-- Whether strict mode should treat an untrusted cache file as a miss (compile
+- Whether enforce mode should treat an untrusted cache file as a miss (compile
   from checked source) or a hard error.
+- Whether audit records should also go to a dedicated file, separate from the
+  error log, so that monitoring can watch them without parsing other errors.
