@@ -63,6 +63,17 @@ With those three off, stock PHP already satisfies a kernel W^X policy for its
 own memory; with the defaults in this tree, only `pcre.jit` needs changing.
 What PHP does not yet do is take part in the policy for the PHP code it runs.
 
+That opcodes are data matters only to the CPU. For deciding what PHP may load,
+this design treats them as executable code. An opcode array decides what the
+process does just as machine code would: it can call any function PHP has,
+`system()` included. So a cache file gets the same trust decision as a native
+binary or a PHP source file. PHP loads it only if the kernel says it may be
+executed: it has the execute bit, is not on a `noexec` mount, is not open for
+writing, and passes the LSM's policy. In practice, that means it is marked
+executable and lives on the verity image. The cache stays out of executable
+memory; only the decision about loading it is the one the kernel makes for code.
+Section 1 describes how PHP asks.
+
 ## Design
 
 ### 1. PHP asks the kernel before compiling or loading code
